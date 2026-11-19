@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站动态分组过滤
 // @namespace    https://github.com/chengdidididi
-// @version      1.0
-// @description  可以在渲染动态时筛选关注列表分组
+// @version      1.1
+// @description  可以在渲染动态时筛选关注列表分组（分组标签栏随B站浅色/深色主题变色）
 // @author       chnaxoeng
 // @match        https://t.bilibili.com/*
 // @grant        unsafeWindow
@@ -19,18 +19,30 @@
         isFiltering: false, // 是否开启过滤模式
         targetUids: [], // 当前选中的目标UID列表
         myUid: null,// 当前登录用户的UID
+        currentGroupName: '',// 当前过滤的分组名；空串表示「全部动态」。空态提示要用它，避免快速切换分组时提示串台
+        switchPending: false,// 正在切分组：遮罩期间不把旧列表露出来
+        inflight: 0,// 在途的动态流请求数，用于判断「最后一个请求也空了」再显示空态
+        pendingEmpty: null,// 在途请求还没回来时先记下这次空态，等全部请求结束再显示
         consecutiveEmptyResponses:0//熔断计数器，当连续访问分页未命中次数过多时熔断
     };
 
     const API_CONFIG = {
         TAGS: 'https://api.bilibili.com/x/relation/tags', // 获取分组列表
         TAG_USERS: 'https://api.bilibili.com/x/relation/tag',// 获取分组下的成员
+        // 特别关注是虚拟分组（tagid 恒为 -10），成员列表有独立接口，一次返回全部 mid、不分页
+        TAG_SPECIAL: 'https://api.bilibili.com/x/relation/tag/special',
         FEED_API: 'polymer/web-dynamic/v1/feed/all'// 动态流API片段
     };
 
+    // 特别关注在 /x/relation/tags 里固定为 -10，属于内置虚拟分组
+    const SPECIAL_TAG_ID = -10;
+
     const UI_CONFIG = {
         MAX_RETRY_PAGES: 10, // 过滤模式下，如果没有匹配内容，最大自动翻页数
-        MAX_EMPTY_BATCHES: 3//最大连续空包数
+        MAX_EMPTY_BATCHES: 3,//最大连续空包数
+        EMPTY_STATE_SETTLE_MS: 80,// 等前端把响应渲染完再判断是否补空态，避免和它的重绘抢同一帧
+        NOTICE_SETTLE_MS: 120,// 结果回来后等前端替换完子节点再撤掉遮罩，否则会先闪一下旧列表
+        NOTICE_TIMEOUT_MS: 15000// 兜底：请求没触发或挂住时，别让遮罩一直挂在页面上
     };
 
     // --- Fetch API劫持实现动态过滤 ---
@@ -48,7 +60,20 @@
 
         // 仅在开启过滤且请求为动态流时拦截
         if (GLOBAL_STATE.isFiltering && urlString.includes(API_CONFIG.FEED_API)) {
-            return await fetchUntilFound(urlString, options, 1);
+            // 首屏请求不带 offset；脚本自己续页时会塞 offset，所以这个判断只在最外层做一次并一路传下去
+            GLOBAL_STATE.inflight++;
+            try {
+                return await fetchUntilFound(urlString, options, 1, !hasOffsetParam(urlString));
+            } finally {
+                GLOBAL_STATE.inflight--;
+                // 切分组会同时触发「视频」「全部」两个请求，空态要等最后一个也回来了再下结论，
+                // 否则先回来的那个是空的，会把内容盖成「暂无新动态」
+                if (GLOBAL_STATE.inflight === 0 && GLOBAL_STATE.pendingEmpty) {
+                    const pending = GLOBAL_STATE.pendingEmpty;
+                    GLOBAL_STATE.pendingEmpty = null;
+                    scheduleEmptyState(pending.groupName, pending.replace);
+                }
+            }
         }
 
         return originalFetch(urlOrRequest, options);//当过滤未开启或不是动态流api时，调用原fetch方法
@@ -64,7 +89,7 @@
         }
     }
 
-    async function fetchUntilFound(url, options, attempt) {
+    async function fetchUntilFound(url, options, attempt, isFirstScreen) {
         try {
             const response = await originalFetch(url, options);
             if (!response.ok) return response;
@@ -92,6 +117,8 @@
 
             if (filteredItems.length > 0) {// 当过滤后至少有一条，则说明命中了数据
                 GLOBAL_STATE.consecutiveEmptyResponses = 0;//清空熔断计数器
+                GLOBAL_STATE.pendingEmpty = null;//有内容了，之前挂起的空态作废
+                revealFeed();// 切分组时撤掉遮罩；滚动加载时顺手清掉底部的「没有更多」
                 data.data.items = filteredItems;//重新把过滤后的数组包装成json作response传给前端渲染
                 return new Response(JSON.stringify(data), {
                     status: response.status,
@@ -103,7 +130,7 @@
             // 未命中且动态流显示还能往下、且未达到最大未命中阈值时，继续翻页
             if (hasMore && nextOffset && attempt <= UI_CONFIG.MAX_RETRY_PAGES) {
                 const nextUrl = constructNextUrl(url, nextOffset);
-                return await fetchUntilFound(nextUrl, options, attempt + 1);
+                return await fetchUntilFound(nextUrl, options, attempt + 1, isFirstScreen);
             }
 
             // 达到尝试上限，返回空数据并同步 offset
@@ -116,6 +143,18 @@
                 data.data.has_more = false;//达到尝试上限的次数达到阈值，触发熔断，将has_more置为false避免再进行刷新
             }
 
+            // B站对「items 为空」的响应基本不做处理，页面会停在上一组的内容上，看起来就像点了没反应。
+            // 所以这里必须自己补一个空态提示，否则该分组无论多空都不会有任何视觉反馈。
+            // 首屏空 = 整组没内容；翻页空 = 只是这之后没有了，提示要留在底部。
+            if (GLOBAL_STATE.inflight > 1) {
+                // 切分组会同时发「视频」「全部」两个请求，先回来的那个可能本来就是空的；
+                // 先记下来，等最后一个请求结束再决定要不要显示空态
+                GLOBAL_STATE.pendingEmpty = { groupName: GLOBAL_STATE.currentGroupName, replace: isFirstScreen };
+            } else {
+                GLOBAL_STATE.pendingEmpty = null;//没有别的请求在飞，直接下结论
+                scheduleEmptyState(GLOBAL_STATE.currentGroupName, isFirstScreen);
+            }
+
             return new Response(JSON.stringify(data), {
                 status: response.status,
                 statusText: response.statusText,
@@ -125,6 +164,102 @@
         } catch (e) {
             console.error('Fetch filter error:', e);
             return originalFetch(url, options);
+        }
+    }
+
+    // --- 列表提示（遮罩 / 空态 / 底部提示） ---
+    // B站动态列表容器是 .bili-dyn-list__items，单条动态是 .bili-dyn-list__item。
+    // 提示节点始终插成列表的兄弟节点，不去改列表内部的子节点：那里是 B站 自己的渲染结果，插进去会被下次重渲染抹掉。
+    //
+    // 两种摆法：
+    //   cover  盖住列表并占住它的位置（切分组时的「正在筛选」、首屏翻空时的「暂无新动态」）；
+    //   bottom 列表保持显示，提示追加在列表末尾（往下翻页翻空时，不能把已有内容顶掉）。
+    function showNotice(text, cover, retriesLeft = 10) {
+        const list = document.querySelector('.bili-dyn-list__items');
+        if (!list) {// 列表还没渲染出来（刚切 tab 的那一瞬间），稍后再试
+            if (retriesLeft > 0) setTimeout(() => showNotice(text, cover, retriesLeft - 1), 120);
+            return;
+        }
+
+        let notice = document.querySelector('.dyn-filter-notice');
+        if (!notice) notice = document.createElement('div');
+        notice.className = cover ? 'dyn-filter-notice' : 'dyn-filter-notice dyn-filter-notice--bottom';
+        notice.textContent = text;
+
+        if (cover) {
+            list.parentNode.insertBefore(notice, list);
+            list.style.display = 'none';
+        } else {
+            list.style.display = '';
+            list.parentNode.insertBefore(notice, list.nextSibling);
+        }
+    }
+
+    function clearNotice() {
+        const notice = document.querySelector('.dyn-filter-notice');
+        if (notice) notice.remove();
+        const list = document.querySelector('.bili-dyn-list__items');
+        if (list) list.style.display = '';
+    }
+
+    function showEmptyState(groupName, replace, retriesLeft = 10) {
+        if (!groupName) return;
+        const list = document.querySelector('.bili-dyn-list__items');
+        // 一条动态都没渲染出来时，即使这次是翻页请求也只能占位，否则提示会孤零零挂在空白下面
+        const hasItems = !!(list && list.querySelector('.bili-dyn-list__item'));
+        const asReplacement = replace || !hasItems;
+        const text = asReplacement ? `「${groupName}」暂无新动态` : `「${groupName}」没有更多新动态了`;
+        showNotice(text, asReplacement, retriesLeft);
+    }
+
+    // 延后到前端渲染完成再补空态；期间若用户已经切走分组，就不该再显示了
+    function scheduleEmptyState(groupName, replace) {
+        if (!groupName) return;
+        setTimeout(() => {
+            if (GLOBAL_STATE.currentGroupName !== groupName) return;
+            GLOBAL_STATE.switchPending = false;
+            showEmptyState(groupName, replace);
+        }, UI_CONFIG.EMPTY_STATE_SETTLE_MS);
+    }
+
+    // 切分组时 B站 会先拿内存里的旧列表画一遍，再去请求；不遮的话会先闪一下「全部」的内容，
+    // 过几秒过滤结果到了才换掉。这里先盖一块提示顶住，等过滤结果回来再撤。
+    let noticeToken = 0;
+    function beginSwitch(groupName) {
+        GLOBAL_STATE.switchPending = true;
+        GLOBAL_STATE.pendingEmpty = null;
+        showNotice(`正在筛选「${groupName}」…`, true);
+        const token = ++noticeToken;
+        setTimeout(() => {
+            // 请求没被触发或者挂住了，别让遮罩一直贴在页面上
+            if (token === noticeToken && GLOBAL_STATE.switchPending) {
+                GLOBAL_STATE.switchPending = false;
+                clearNotice();
+            }
+        }, UI_CONFIG.NOTICE_TIMEOUT_MS);
+    }
+
+    // 结果已经交回前端，但它要等下一帧才替换子节点；先等它画完再露出列表，否则会先闪一下旧缓存
+    function finishSwitch() {
+        GLOBAL_STATE.switchPending = false;
+        const token = ++noticeToken;
+        setTimeout(() => {
+            if (token === noticeToken) clearNotice();
+        }, UI_CONFIG.NOTICE_SETTLE_MS);
+    }
+
+    // 有内容要展示：切分组时撤遮罩，滚动加载时清掉底部的「没有更多」
+    function revealFeed() {
+        if (GLOBAL_STATE.switchPending) finishSwitch();
+        else clearNotice();
+    }
+
+    // 首屏请求不带 offset；带 offset 说明是往下翻页（或脚本自己构造的续页地址）
+    function hasOffsetParam(urlString) {
+        try {
+            return !!new URL(urlString, location.href).searchParams.get('offset');
+        } catch (e) {
+            return false;
         }
     }
 
@@ -140,8 +275,25 @@
         return await res.json();
     }
 
+    // 特别关注走独立接口：/x/relation/tag 对 -10 是否可用在B站各端并不一致，
+    // 而 /x/relation/tag/special 一次就能拿到全部 mid，失败时再退回分页接口。
+    async function fetchSpecialUids() {
+        try {
+            const json = await fetchJson(API_CONFIG.TAG_SPECIAL);
+            if (json.code === 0 && Array.isArray(json.data)) return json.data;
+        } catch (e) {
+            console.warn('特别关注接口失败，退回分组接口', e);
+        }
+        return null;
+    }
+
     async function fetchUidsByTag(tagId) {
         if (!GLOBAL_STATE.myUid) GLOBAL_STATE.myUid = getMyUid();//确保拿到了当前用户的 ID
+
+        if (tagId === SPECIAL_TAG_ID) {
+            const special = await fetchSpecialUids();
+            if (special) return special;
+        }
 
         let page = 1;
         let pageSize = 20;
@@ -152,7 +304,11 @@
             const url = `${API_CONFIG.TAG_USERS}?mid=${GLOBAL_STATE.myUid}&tagid=${tagId}&pn=${page}&ps=${pageSize}`;
             try {
                 const json = await fetchJson(url);
-                if (json.code !== 0) break;//API 返回错误码，强制停止
+                if (json.code !== 0) {
+                    // 第一页就报错说明这次过滤拿不到任何 UID，抛出去让 UI 显示失败而不是静默空掉
+                    if (page === 1) throw new Error(json.message || `code ${json.code}`);
+                    break;
+                }
 
                 const data = json.data;
                 if (!data || !data.length) {// 如果 data 是空的，或者长度为 0，说明没数据了，停止
@@ -170,6 +326,7 @@
                     await new Promise(r => setTimeout(r, 100));// 等待0.1秒，防止请求太快触发 B 站的 412/429 频率限制。
                 }
             } catch (e) {
+                if (page === 1) throw e;
                 hasMore = false;
             }
         }
@@ -196,9 +353,13 @@
         window.scrollTo({ top: 0, behavior: 'smooth' });//滚动回顶部
     }
 
+    // 颜色一律取自 B 站自己的主题变量，浅色/深色模式都会自动跟随。
+    // --bew-content-solid 是 BewlyBewly 深色模式下给动态页卡片（含原生 tab 栏）用的底色，
+    // 没有它时回退到 B 站的 --bg1，避免深色模式下这块标签栏又变成白条。
+    // 不画边框：原生 tab 栏本身就是无边框的圆角卡片，画描边在深色模式下会露出一圈浅色框
     const STYLE_CSS = `
         .tab-container {
-            background: #ffffff;
+            background-color: var(--bew-content-solid, var(--bg1, #ffffff));
             border-radius: 6px;
             padding: 0 10px;
             margin-bottom: 8px;
@@ -209,7 +370,6 @@
             position: relative;
             width: 100%;
             box-sizing: border-box;
-            border: 1px solid #f1f2f3;
         }
         .tab-scroll-area {
             display: flex;
@@ -230,7 +390,7 @@
             position: relative;
             margin-right: 24px;
             font-size: 14px;
-            color: #61666d;
+            color: var(--text2, #61666d);
             cursor: pointer;
             height: 100%;
             display: flex;
@@ -241,15 +401,25 @@
             user-select: none;
         }
         .tab-item:hover {
-            color: #00aeec;
+            color: var(--brand_blue, #00aeec);
         }
         .tab-item.active {
-            color: #00aeec;
+            color: var(--brand_blue, #00aeec);
             font-weight: 600;
         }
         .tab-item.loading {
-            color: #fb7299;
+            color: var(--brand_pink, #fb7299);
             cursor: wait;
+        }
+        .dyn-filter-notice {
+            padding: 48px 0;
+            text-align: center;
+            font-size: 14px;
+            color: var(--text3, var(--text2, #9499a0));
+            user-select: none;
+        }
+        .dyn-filter-notice--bottom {
+            padding: 20px 0;
         }
     `;
 
@@ -268,7 +438,7 @@
         }, { passive: false });
 
         const defaultTab = { name: '全部动态', id: -1 };//默认第一项为全部动态，此时设置为不开启过滤
-        const allTabs = [defaultTab, ...tags.map(t => ({ name: t.name, id: t.tagid }))];//仅获取name和id
+        const allTabs = [defaultTab, ...tags.map(t => ({ name: t.name, id: t.tagid, count: t.count }))];//仅获取name和id（count用于校验成员是否真的拉到）
 
         allTabs.forEach((tab) => {//逐一生成标签
             const item = document.createElement('div');
@@ -284,6 +454,9 @@
                 if (tab.id === -1) {//当点击全部动态时关闭过滤
                     GLOBAL_STATE.isFiltering = false;
                     GLOBAL_STATE.targetUids = [];
+                    GLOBAL_STATE.currentGroupName = '';
+                    GLOBAL_STATE.switchPending = false;
+                    clearNotice();
                     forceFeedReload(); // 强制刷新
                 } else {
                     const originalText = item.innerText;
@@ -293,17 +466,37 @@
                     try {
                         const uids = await fetchUidsByTag(tab.id);//获取UID
 
+                        if (!uids.length) {
+                            // 拿不到任何成员（接口异常或分组本来就是空的），直接说明情况，
+                            // 不要开着过滤去请求，否则每点一次就白翻 10 页
+                            GLOBAL_STATE.isFiltering = false;
+                            GLOBAL_STATE.targetUids = [];
+                            GLOBAL_STATE.currentGroupName = tab.name;
+                            GLOBAL_STATE.switchPending = false;
+                            showEmptyState(tab.name, true);
+                            console.warn(`分组「${tab.name}」未取到成员，分组人数标记为 ${tab.count}`);
+                            return;
+                        }
+
                         GLOBAL_STATE.targetUids = uids;//更新全局状态
+                        GLOBAL_STATE.currentGroupName = tab.name;
                         GLOBAL_STATE.isFiltering = true;
+                        beginSwitch(tab.name);// 先盖住旧列表，免得 B站 用缓存把「全部」的内容又画出来
 
                         await forceFeedReload(); //强制清空并刷新列表
 
                     } catch (err) {
                         console.error('Group fetch failed', err);
                         item.innerText = '获取失败';
+                        GLOBAL_STATE.isFiltering = false;
+                        GLOBAL_STATE.targetUids = [];
+                        GLOBAL_STATE.currentGroupName = '';
+                        GLOBAL_STATE.switchPending = false;
+                        clearNotice();
                     } finally {
                         item.classList.remove('loading');
-                        item.innerText = originalText;
+                        // 失败时 innerText 已经被改成「获取失败」，不要再用原名覆盖回去
+                        if (item.innerText === '加载中...') item.innerText = originalText;
                     }
                 }
             };
